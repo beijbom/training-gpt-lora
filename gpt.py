@@ -1,22 +1,16 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from data import get_encoder_decoder_vocab_size
-
-
 
 # hyperparameters
-
-block_size = 32 # what is the maximum context length for predictions?
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-n_embd = 64
-n_head = 2
+n_embd = 384
+n_head = 6
 n_layer = 6
 dropout = 0.2
 # ------------
-
-_, _, vocab_size = get_encoder_decoder_vocab_size()
 
 torch.manual_seed(1337)
 
@@ -97,7 +91,7 @@ class Block(nn.Module):
 
 class GPTLanguageModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, vocab_size):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
@@ -154,5 +148,3 @@ class GPTLanguageModel(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
-
-

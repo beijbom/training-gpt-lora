@@ -1,26 +1,27 @@
-from data import get_batch_factory
-from gpt import GPTLanguageModel
-import torch
+import argparse
+import os
+import time
+from io import BytesIO
 from typing import Callable
-import fire
-from data import get_encoder_decoder_vocab_size
 
-# hyperparameters
-max_iters = 5000
-eval_interval = 500
-learning_rate = 3e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-batch_size = 64 # how many independent sequences will we process in parallel?
-block_size = 32 # what is the maximum context length for predictions?
-# ------------
+import modal
+import torch
+
+from data import get_batch_factory, get_encoder_decoder_vocab_size
+from gpt import GPTLanguageModel, batch_size, block_size
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Modal configuration
+lora_image = modal.Image.debian_slim().pip_install_from_requirements("requirements.txt")
+app = modal.App("lora-tutorial")
 
 
 @torch.no_grad()
-def estimate_loss(model: GPTLanguageModel, get_batch: Callable):
+def estimate_loss(model: GPTLanguageModel, get_batch: Callable, eval_iters: int):
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -30,53 +31,156 @@ def estimate_loss(model: GPTLanguageModel, get_batch: Callable):
     model.train()
     return out
 
-def train():
 
-    model = GPTLanguageModel()
-    m = model.to(device)
+@app.function(image=lora_image, gpu="A100", timeout=3600)
+def train(
+    files: dict[str, BytesIO],
+    max_iters: int = 5000,
+    eval_interval: int = 500,
+    learning_rate: float = 3e-4,
+    eval_iters: int = 500,
+) -> dict[str, BytesIO]:
+
+    encode, _, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
+
+    model = GPTLanguageModel(vocab_size)
+    model = model.to(device)
+
+    # Freeze all LoRA weights
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.requires_grad = False
+
     # print the number of parameters in the model
-    print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M trainable parameters")
 
     # create a PyTorch optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    get_batch = get_batch_factory('shakespeare.txt', block_size, batch_size, device)
+    get_batch = get_batch_factory(files["shakespeare.txt"], block_size, batch_size, device, encode)
+    start_time = time.time()
+    for iter in range(max_iters):
+        # every once in a while evaluate the loss on train and val sets
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss(model, get_batch, eval_iters)
+            print(
+                f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, timer {time.time() - start_time:.2f}s"
+            )
+
+        # sample a batch of data
+        xb, yb = get_batch("train")
+
+        # evaluate the loss
+        _, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    # Save the model weights
+    buff = BytesIO()
+    torch.save(model.state_dict(), buff)
+    return {"shakespeare.pth": buff}
+
+
+@app.function(image=lora_image, gpu="A100")
+def generate(files: dict[str, BytesIO], base_model_checkpoint: str, lora_model_checkpoint: str | None = None):
+    _, decode, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
+
+    model = GPTLanguageModel(vocab_size)
+    model.load_state_dict(torch.load(files[base_model_checkpoint]), strict=False)
+    if lora_model_checkpoint:
+        model.load_state_dict(torch.load(files[lora_model_checkpoint]), strict=False)
+    model.eval()
+    model.to(device)
+
+    # generate from the model
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
+
+
+@app.function(image=lora_image, gpu="A100")
+def tune(files: dict[str, BytesIO], full: bool = False):
+    max_iters = 300
+    eval_interval = 100
+
+    model = GPTLanguageModel()
+    model.load_state_dict(torch.load(files["shakespeare.pth"]), strict=False)
+    model = model.to(device)
+
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+
+    # Freeze all weights except LoRA weights
+    if not full:
+        for name, param in model.named_parameters():
+            if "lora" not in name:
+                param.requires_grad = False
+
+    # print the number of parameters in the model
+    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M trainable parameters")
+
+    # create a PyTorch optimizer (only for trainable parameters)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
+
+    get_batch = get_batch_factory("hemingway.txt", block_size, batch_size, device)
 
     for iter in range(max_iters):
-
         # every once in a while evaluate the loss on train and val sets
         if iter % eval_interval == 0 or iter == max_iters - 1:
             losses = estimate_loss(model, get_batch)
             print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
         # sample a batch of data
-        xb, yb = get_batch('train')
+        xb, yb = get_batch("train")
 
         # evaluate the loss
         logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-
     # Save the model weights
-    torch.save(model.state_dict(), 'shakespeare_weights.pth')
+    new_weights = model.state_dict()
+    lora_weights = {k: v for k, v in new_weights.items() if "lora" in k}
+    torch.save(lora_weights, "hemingway_lora.pth")
     print("Model weights saved successfully.")
 
-def generate(model_checkpoint: str = 'shakespeare_weights.pth'):
-    model = GPTLanguageModel()
-    model.load_state_dict(torch.load(model_checkpoint))
-    model.eval()
-    model.to(device)
 
-    _, decode, _ = get_encoder_decoder_vocab_size()
+class FileSyncer:
+    files_to_sync = ["shakespeare.txt", "hemingway.txt", "shakespeare.pth", "hemingway.pth", "hemingway_lora.pth"]
 
-    # generate from the model
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
+    @classmethod
+    def load(cls) -> dict[str, BytesIO]:
+        files: dict[str, BytesIO] = {}
+        for filename in cls.files_to_sync:
+            if os.path.exists(filename):
+                with open(filename, "rb") as f:
+                    files[filename] = BytesIO(f.read())
+        return files
 
-if __name__ == '__main__':
+    @classmethod
+    def store(cls, files: dict[str, BytesIO]) -> None:
+        for filename, data in files.items():
+            with open(filename, "wb") as f:
+                f.write(data.getbuffer())
 
-    fire.Fire({
-        'train': train,
-        'generate': generate
-    })
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, default="train")
+    parser.add_argument("--base_model_checkpoint", type=str, default="shakespeare.pth")
+    parser.add_argument("--lora_model_checkpoint", type=str, default=None)
+    args = parser.parse_args()
+
+    input_files = FileSyncer.load()
+
+    with modal.enable_output():
+        with app.run():
+            if args.mode == "train":
+                output_files = train.remote(input_files)
+            elif args.mode == "generate":
+                output_files = generate.remote(input_files, args.base_model_checkpoint, args.lora_model_checkpoint)
+            elif args.mode == "tune":
+                output_files = tune.remote(input_files)
+    FileSyncer.store(output_files)
