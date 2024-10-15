@@ -10,6 +10,8 @@ n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
+lora_rank = 8
+lora_alpha = 16
 # ------------
 
 torch.manual_seed(1337)
@@ -23,15 +25,31 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.query_lora_a = nn.Linear(n_embd, lora_rank, bias=False)
+        self.query_lora_b = nn.Linear(lora_rank, head_size, bias=False)
+        self.value_lora_a = nn.Linear(n_embd, lora_rank, bias=False)
+        self.value_lora_b = nn.Linear(lora_rank, head_size, bias=False)
+
+        # Initialize LoRA B matrices with zeros
+        nn.init.zeros_(self.query_lora_b.weight)
+        nn.init.zeros_(self.value_lora_b.weight)
+
+        # Initialize LoRA A matrices with random normal
+        nn.init.normal_(self.query_lora_a.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.value_lora_a.weight, mean=0.0, std=0.02)
+
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # input of size (batch, time-step, channels)
+        # input of size (batch, time-step, n_embd)
         # output of size (batch, time-step, head size)
         B, T, C = x.shape
         k = self.key(x)  # (B,T,hs)
         q = self.query(x)  # (B,T,hs)
+        q_lora = self.query_lora_b(self.query_lora_a(x))
+        q = q + q_lora * lora_alpha / lora_rank
+
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
@@ -39,6 +57,8 @@ class Head(nn.Module):
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         v = self.value(x)  # (B,T,hs)
+        v_lora = self.value_lora_b(self.value_lora_a(x))
+        v = v + v_lora * lora_alpha / lora_rank
         out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
 

@@ -80,15 +80,15 @@ def train(
 @app.function(image=lora_image, gpu="A100")
 def generate(
     files: dict[str, BytesIO],
-    base_model_checkpoint: str,
-    lora_model_checkpoint: str | None = None,
+    base_model: str,
+    lora_model: str | None = None,
 ) -> dict[str, BytesIO]:
     _, decode, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
 
     model = GPTLanguageModel(vocab_size)
-    model.load_state_dict(torch.load(files[base_model_checkpoint]), strict=False)
-    if lora_model_checkpoint:
-        model.load_state_dict(torch.load(files[lora_model_checkpoint]), strict=False)
+    model.load_state_dict(torch.load(files[base_model]), strict=False)
+    if lora_model:
+        model.load_state_dict(torch.load(files[lora_model]), strict=False)
     model.eval()
     model.to(device)
 
@@ -96,10 +96,11 @@ def generate(
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
 
-    more = decode(model.generate(context, max_new_tokens=5000)[0].tolist())
-    buff = BytesIO()
-    buff.write(more.encode("utf-8"))
-    return {"more.txt": buff}
+    # Generate more and store to disk (a bit slow)
+    # more = decode(model.generate(context, max_new_tokens=5000)[0].tolist())
+    # buff = BytesIO()
+    # buff.write(more.encode("utf-8"))
+    # return {"more.txt": buff}
 
 
 @app.function(image=lora_image, gpu="A100")
@@ -108,7 +109,7 @@ def tune(
     max_iters: int = 300,
     eval_interval: int = 100,
     eval_iters: int = 200,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 3e-3,
 ):
     encode, _, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
 
@@ -116,8 +117,14 @@ def tune(
     model.load_state_dict(torch.load(files["shakespeare.pth"]), strict=False)
     model = model.to(device)
 
+    # Freeze all non-lora parameters
+    for name, param in model.named_parameters():
+        if "lora" not in name:
+            param.requires_grad = False
+
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M trainable parameters")
 
     # create a PyTorch optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
@@ -144,8 +151,10 @@ def tune(
 
     # Save the model weights
     buff = BytesIO()
-    torch.save(model.state_dict(), buff)
-    return {"hemingway.pth": buff}
+    state_dict = model.state_dict()
+    lora_layers = {k: v for k, v in state_dict.items() if "lora" in k}
+    torch.save(lora_layers, buff)
+    return {"hemingway_lora.pth": buff}
 
 
 class FileSyncer:
@@ -177,8 +186,8 @@ class FileSyncer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="train")
-    parser.add_argument("--base_model_checkpoint", type=str, default="shakespeare.pth")
-    parser.add_argument("--lora_model_checkpoint", type=str, default=None)
+    parser.add_argument("--base_model", type=str, default="shakespeare.pth")
+    parser.add_argument("--lora_model", type=str, default=None)
     args = parser.parse_args()
 
     input_files = FileSyncer.load()
@@ -188,7 +197,7 @@ if __name__ == "__main__":
             if args.mode == "train":
                 output_files = train.remote(input_files)
             elif args.mode == "generate":
-                output_files = generate.remote(input_files, args.base_model_checkpoint, args.lora_model_checkpoint)
+                output_files = generate.remote(input_files, args.base_model, args.lora_model)
                 print("Done generating.")
             elif args.mode == "tune":
                 output_files = tune.remote(input_files)
