@@ -38,18 +38,12 @@ def train(
     max_iters: int = 5000,
     eval_interval: int = 500,
     learning_rate: float = 3e-4,
-    eval_iters: int = 500,
 ) -> dict[str, BytesIO]:
 
     encode, _, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
 
     model = GPTLanguageModel(vocab_size)
     model = model.to(device)
-
-    # Freeze all LoRA weights
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            param.requires_grad = False
 
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
@@ -84,7 +78,11 @@ def train(
 
 
 @app.function(image=lora_image, gpu="A100")
-def generate(files: dict[str, BytesIO], base_model_checkpoint: str, lora_model_checkpoint: str | None = None):
+def generate(
+    files: dict[str, BytesIO],
+    base_model_checkpoint: str,
+    lora_model_checkpoint: str | None = None,
+) -> dict[str, BytesIO]:
     _, decode, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
 
     model = GPTLanguageModel(vocab_size)
@@ -98,39 +96,42 @@ def generate(files: dict[str, BytesIO], base_model_checkpoint: str, lora_model_c
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
 
+    more = decode(model.generate(context, max_new_tokens=5000)[0].tolist())
+    buff = BytesIO()
+    buff.write(more.encode("utf-8"))
+    return {"more.txt": buff}
+
 
 @app.function(image=lora_image, gpu="A100")
-def tune(files: dict[str, BytesIO], full: bool = False):
-    max_iters = 300
-    eval_interval = 100
+def tune(
+    files: dict[str, BytesIO],
+    max_iters: int = 300,
+    eval_interval: int = 100,
+    eval_iters: int = 200,
+    learning_rate: float = 1e-4,
+):
+    encode, _, vocab_size = get_encoder_decoder_vocab_size(files["shakespeare.txt"])
 
-    model = GPTLanguageModel()
+    model = GPTLanguageModel(vocab_size)
     model.load_state_dict(torch.load(files["shakespeare.pth"]), strict=False)
     model = model.to(device)
 
     # print the number of parameters in the model
     print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
 
-    # Freeze all weights except LoRA weights
-    if not full:
-        for name, param in model.named_parameters():
-            if "lora" not in name:
-                param.requires_grad = False
-
-    # print the number of parameters in the model
-    print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
-    print(sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M trainable parameters")
-
     # create a PyTorch optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
 
-    get_batch = get_batch_factory("hemingway.txt", block_size, batch_size, device)
+    get_batch = get_batch_factory(files["hemingway.txt"], block_size, batch_size, device, encode)
 
+    start_time = time.time()
     for iter in range(max_iters):
         # every once in a while evaluate the loss on train and val sets
         if iter % eval_interval == 0 or iter == max_iters - 1:
-            losses = estimate_loss(model, get_batch)
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            losses = estimate_loss(model, get_batch, eval_iters)
+            print(
+                f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, timer {time.time() - start_time:.2f}s"
+            )
 
         # sample a batch of data
         xb, yb = get_batch("train")
@@ -140,15 +141,22 @@ def tune(files: dict[str, BytesIO], full: bool = False):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
     # Save the model weights
-    new_weights = model.state_dict()
-    lora_weights = {k: v for k, v in new_weights.items() if "lora" in k}
-    torch.save(lora_weights, "hemingway_lora.pth")
-    print("Model weights saved successfully.")
+    buff = BytesIO()
+    torch.save(model.state_dict(), buff)
+    return {"hemingway.pth": buff}
 
 
 class FileSyncer:
-    files_to_sync = ["shakespeare.txt", "hemingway.txt", "shakespeare.pth", "hemingway.pth", "hemingway_lora.pth"]
+    files_to_sync = [
+        "shakespeare.txt",
+        "hemingway.txt",
+        "shakespeare.pth",
+        "hemingway.pth",
+        "hemingway_lora.pth",
+        "more-shakespeare.txt",
+    ]
 
     @classmethod
     def load(cls) -> dict[str, BytesIO]:
@@ -181,6 +189,7 @@ if __name__ == "__main__":
                 output_files = train.remote(input_files)
             elif args.mode == "generate":
                 output_files = generate.remote(input_files, args.base_model_checkpoint, args.lora_model_checkpoint)
+                print("Done generating.")
             elif args.mode == "tune":
                 output_files = tune.remote(input_files)
     FileSyncer.store(output_files)
